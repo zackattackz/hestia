@@ -1,0 +1,31 @@
+(define-module (hestia systems util nvidia)
+  #:use-module (gnu)
+  #:use-module (gnu packages xorg)
+  #:use-module (gnu packages file-systems)
+  #:use-module (gnu services desktop)
+  #:use-module (gnu services xorg)
+  #:use-module (gnu packages linux)
+  #:use-module (nongnu packages linux)
+  #:use-module (nongnu services nvidia)
+  #:use-module (nongnu packages nvidia)
+  #:use-module (guix transformations)
+  #:use-module (nongnu system linux-initrd))
+
+(define-public inject-nvidia
+  (lambda (base-operating-system)
+    (operating-system
+     (inherit base-operating-system)
+     (kernel-loadable-modules
+      (cons nvidia-module
+	    (operating-system-kernel-loadable-modules base-operating-system)))
+     (services (cons (service nvidia-service-type)
+		     (modify-services (operating-system-user-services base-operating-system)
+				      (slim-service-type config =>
+							 (let ((base-xorg-configuration (slim-configuration-xorg config)))
+							 (slim-configuration
+							  (inherit config)
+							  (xorg-configuration (xorg-configuration
+							   (inherit base-xorg-configuration)
+							   (modules (cons nvidia-driver (xorg-configuration-modules base-xorg-configuration)))
+							   (server (replace-mesa (xorg-configuration-server base-xorg-configuration)))
+							   (drivers (cons "nvidia" (xorg-configuration-modules base-xorg-configuration))))))))))))))

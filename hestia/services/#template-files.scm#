@@ -1,0 +1,182 @@
+(define-module (hestia services template-files)
+  #:use-module (gnu services)
+  #:use-module (gnu home services)
+  #:use-module (gnu services configuration)
+  #:use-module (ice-9 ftw)
+  #:use-module (ice-9 hash-table)
+  #:use-module (ice-9 textual-ports)
+
+  #:export (home-template-files-configuration
+	    read-templates
+	    read-values))
+
+(define-configuration/no-serialization home-template-files-configuration
+  (templates
+   (hash-table)
+   "alist of file-name mapping to template string")
+  (values
+    (hash-table)
+    "alist of file-name mapping to alist of variable-name mapping to value to use for templating"))
+
+(define (hash-set-into! into from)
+  "sets items from 'from' into 'into'"
+  (hash-for-each (lambda (k v) (hash-set! into k v)) from))
+
+(define (hash-copy from)
+  "returns new hash-table with items from 'from' copied over"
+  (let ((new (make-hash-table)))
+    (hash-set-into! new from)
+    new))
+
+(define (hash-copy-into into from)
+  "returns new hash-table copied from 'into', with items from 'from' overriding"
+  (let ((result (hash-copy into)))
+    (hash-set-into! result from)
+    result))
+
+(define (file-tree-map ft f)
+  (define (rec ft f acc)
+    (cond ((nil? ft) (list))
+	  ((= (length ft) 2) (f ft acc))
+	  (else (let ((file (list-head ft 2))
+		      (children (cddr ft)))
+		  (append
+		   (f file acc)
+		   (map (lambda (child)
+			  (rec
+			   child
+			   f
+			   (cons (car file) acc)))
+			children))))))
+  (rec ft f '()))
+
+(define (file-tree-add-paths ft)
+  "maps all file-names in a file-tree to be a path"
+  (file-tree-map
+   ft
+   (lambda (file acc)
+     (let* ((name (car file))
+	    (stat (cadr file))
+	    (path (cons name acc)))
+       (list path stat)))))
+
+(define (file-tree-flatten ft)
+  (if (= (length ft) 2)
+      (list ft)
+      (let ((file (list-head ft 2))
+	    (children (cddr ft)))
+	(apply
+	 append
+	 (list file)
+	 (map file-tree-flatten children)))))
+
+(define (file-is-dir? file)
+  (eq? (stat:type (cadr file)) 'directory))
+
+(define (files-filter-non-dir files)
+  (filter (negate file-is-dir?) files))
+
+(define (file-name-read-all file-name)
+  "read all contents of file-name into string"
+  (call-with-input-file file-name
+    (lambda (port)
+      (get-string-all port))))
+
+(define (path->file-name path)
+  (if (nil? path)
+      ""
+      (let ((prev (path->file-name (cdr path)))
+	    (curr (car path)))
+	(if (string-null? prev)
+	    curr
+	    (string-append prev "/" curr)))))
+
+(define (file-name->path file-name)
+  (define (rec file-name acc)
+    (if (string-null? file-name)
+        acc
+        (let ((next-delimiter
+	       (string-index file-name #\/)))
+          (if (not (eq? next-delimiter #f))
+              (rec
+	       (substring file-name (+ next-delimiter 1))
+	       (cons (substring file-name 0 next-delimiter) acc))
+              (cons file-name acc)))))
+  (rec file-name '()))
+
+(define (file-name-rm-first file-name)
+  (path->file-name
+   (reverse
+    (cdr
+     (reverse
+      (file-name->path file-name))))))
+
+(define file-tree->file-names
+  (compose (lambda (files)
+	  (map (lambda (file)
+		 (path->file-name (car file)))
+	       files))
+	files-filter-non-dir
+	file-tree-flatten
+	file-tree-add-paths))
+
+(define (file-tree-map-file-names f ft rm-first?)
+  (map
+   (compose
+    f
+    (if rm-first?
+	file-name-rm-first
+	identity))
+   (file-tree->file-names ft)))
+
+(define (file-name-rm-scm-suffix file-name)
+  "removes '.scm' from end of a file-name"
+  (substring file-name 0 (- (string-length file-name) 4)))
+
+(define (file-name-rm-scm-suffix-pair pair)
+  (list
+   (file-name-rm-scm-suffix (car pair))
+   (cadr pair)))
+
+(define (base-path-process-file-name f base-path)
+  (lambda (file-name)
+    (list
+     file-name
+     (f (string-append base-path "/" file-name)))))
+
+(define (base-path-map-file-names f base-path)
+  (file-tree-map-file-names
+   f
+   (file-system-tree base-path)
+   #t))
+
+(define (base-path-process-file-names f base-path)
+  (base-path-map-file-names
+   (base-path-process-file-name f base-path)
+   base-path))
+
+(define (read-templates pkg-files-path templates-dir-name)
+  (base-path-process-file-names
+   file-name-read-all
+   (string-append pkg-files-path "/" templates-dir-name)))
+
+(define (read-values pkg-files-path values-dir-name system-name)
+  (map
+   file-name-rm-scm-suffix-pair
+   (base-path-process-file-names
+    primitive-load
+    (string-append pkg-files-path "/" values-dir-name "/" system-name))))
+
+(define (home-template-files-files-service config)
+  (map (lambda (template)
+	 (identity template))
+       (home-template-files-configuration-templates config)))
+
+(define home-template-files-service-type
+  (service-type (name 'home-template-files)
+		(extensions
+		 (list (service-extension
+			home-files-service-type
+			home-template-files-files-service)))
+		(default-value #f)
+		(description "Extends home-files service to use a whole directory of template files recursively.")))

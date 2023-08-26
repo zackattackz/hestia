@@ -1,0 +1,452 @@
+#+TITLE: System Configuration with Guix
+#+PROPERTY: header-args    :tangle-mode (identity #o444)
+#+PROPERTY: header-args:sh :tangle-mode (identity #o555)
+
+* Table of Contents
+:PROPERTIES:
+:TOC:      :include all :ignore this
+:END:
+:CONTENTS:
+- [[#channels][Channels]]
+- [[#systems][Systems]]
+  - [[#base-configuration][Base Configuration]]
+  - [[#machines][Machines]]
+    - [[#per-system-settings][Per-System Settings]]
+    - [[#typhon][typhon]]
+  - [[#usb-installation-image][USB Installation Image]]
+- [[#profile-management][Profile Management]]
+  - [[#activating-profiles][Activating Profiles]]
+  - [[#updating-profiles][Updating Profiles]]
+  - [[#updating-channels][Updating Channels]]
+- [[#dotfiles-management][Dotfiles Management]]
+  - [[#syncing][Syncing]]
+  - [[#updating][Updating]]
+:END:
+
+* Channels
+*.config/guix/base-channels.scm:*
+
+#+begin_src scheme :tangle .config/guix/base-channels.scm
+
+(cons* (channel (name 'nonguix) (url "https://gitlab.com/nonguix/nonguix")
+        ;; Enable signature verification:
+        (introduction (make-channel-introduction "897c1a470da759236cc11798f4e0a5f7d4d59fbc" (openpgp-fingerprint "2A39 3FFF 68F4 EF7A 3D29 12AF 6F51 20A0 22FB B2D5"))))
+       %default-channels)
+
+#+end_src
+
+* Systems
+
+** Base Configuration
+
+This base configuration is shared between all of the machines I manage with Guix.  Since all of my machines are Lenovo ThinkPad laptops, the same basic configuration applies pretty cleanly across all of them.  This may change in the future.
+
+Any configuration that derives from =base-operating-system= must invoke =guix system= in a specific way to ensure it gets loaded correctly:
+
+#+begin_src sh
+
+sudo -E guix system -L ~/src/hestia/.config/guix/systems reconfigure ~/src/dots/.config/guix/systems/typhon.scm
+
+#+end_src
+
+*.config/guix/systems/base-system.scm:*
+
+#+begin_src scheme :tangle .config/guix/systems/base-system.scm
+
+  (define-module (base-system)
+    #:use-module (gnu)
+    #:use-module (gnu packages xorg)
+    #:use-module (gnu packages file-systems)
+    #:use-module (gnu services desktop)
+    #:use-module (gnu services xorg)
+    #:use-module (gnu packages linux)
+    #:use-module (nongnu packages linux)
+    #:use-module (nongnu system linux-initrd))
+  (use-service-modules
+   linux
+   cups
+   desktop
+   networking
+   ssh
+   xorg)
+
+  (define-public base-operating-system
+    (operating-system
+     (kernel linux-5.15)
+     (kernel-arguments (list "modprobe.blacklist=nouveau,usbmouse,usbkbd" "quiet"))
+     (initrd microcode-initrd)
+     (firmware (list linux-firmware))
+     (locale "en_US.utf8")
+     (timezone "America/New_York")
+     (keyboard-layout (keyboard-layout "us"))
+     (host-name "zaha-desktop")
+
+     (users (cons* (user-account
+		    (name "zaha")
+		    (comment "Zachary Hanham")
+		    (group "users")
+		    (home-directory "/home/zaha")
+		    (supplementary-groups '("wheel" "netdev" "audio" "video" "realtime")))
+		   %base-user-accounts))
+
+     (groups (cons (user-group (system? #t) (name "realtime"))
+		   %base-groups))
+
+     (packages (append (list (specification->package "emacs")
+			     (specification->package "emacs-exwm-themis")
+			     (specification->package
+			      "emacs-desktop-environment")
+			     (specification->package "nss-certs")
+			     (specification->package "steam-devices-udev-rules")
+			     (specification->package "pulseaudio"))
+		       %base-packages))
+
+     (services (cons* (service pam-limits-service-type (list
+							(pam-limits-entry "zaha" 'both 'nofile 524288)
+							(pam-limits-entry "@realtime" 'both 'rtprio 99)
+							(pam-limits-entry "@realtime" 'both 'memlock 'unlimited)))
+		      (service slim-service-type
+			       (slim-configuration
+				(xorg-configuration
+				 (xorg-configuration
+				  (keyboard-layout keyboard-layout)))))
+		      (modify-services %desktop-services
+				       (delete gdm-service-type)
+				       (guix-service-type config => (guix-configuration
+								     (inherit config)
+								     (substitute-urls
+								      (append (list "https://substitutes.nonguix.org")
+									      %default-substitute-urls))
+								     (authorized-keys
+								      (append (list (local-file "./nonguix-signing-key.pub"))
+									      %default-authorized-guix-keys)))))))
+     (bootloader (bootloader-configuration
+		  (bootloader grub-efi-bootloader)
+		  (targets (list "/boot/efi"))
+		  (keyboard-layout keyboard-layout)))
+
+     ;; Guix doesn't like it when there isn't a file-systems
+     ;; entry, so add one that is meant to be overridden
+     (file-systems (cons*
+		    (file-system
+		     (mount-point "/tmp")
+		     (device "none")
+		     (type "tmpfs")
+		     (check? #f))
+		    %base-file-systems))))
+
+
+#+end_src
+
+** nonguix signing key
+
+#+begin_src scheme :tangle .config/guix/systems/nonguix-signing-key.pub
+  (public-key 
+   (ecc 
+    (curve Ed25519)
+    (q #C1FD53E5D4CE971933EC50C9F307AE2171A2D3B52C804642A7A35F84F3A4EA98#)
+    ))
+#+end_src
+
+** NVIDIA
+
+*** inject-nvidia
+
+#+begin_src emacs-lisp :tangle .config/guix/systems/base-system/nvidia.scm
+  (define-module (base-system nvidia)
+    #:use-module (gnu)
+    #:use-module (gnu packages xorg)
+    #:use-module (gnu packages file-systems)
+    #:use-module (gnu services desktop)
+    #:use-module (gnu services xorg)
+    #:use-module (gnu packages linux)
+    #:use-module (nongnu packages linux)
+    #:use-module (nongnu services nvidia)
+    #:use-module (nongnu packages nvidia)
+    #:use-module (guix transformations)
+    #:use-module (nongnu system linux-initrd))
+
+  (define-public inject-nvidia
+    (lambda (base-operating-system)
+      (operating-system
+       (inherit base-operating-system)
+       (kernel-loadable-modules
+	(cons nvidia-module
+	      (operating-system-kernel-loadable-modules base-operating-system)))
+       (services (cons (service nvidia-service-type)
+		       (modify-services (operating-system-user-services base-operating-system)
+					(slim-service-type config =>
+							   (let ((base-xorg-configuration (slim-configuration-xorg config)))
+							   (slim-configuration
+							    (inherit config)
+							    (xorg-configuration (xorg-configuration
+							     (inherit base-xorg-configuration)
+							     (modules (cons nvidia-driver (xorg-configuration-modules base-xorg-configuration)))
+							     (server (replace-mesa (xorg-configuration-server base-xorg-configuration)))
+							     (drivers (cons "nvidia" (xorg-configuration-modules base-xorg-configuration))))))))))))))
+#+end_src
+
+** Machines
+
+*** Per-System Settings
+
+#+begin_src emacs-lisp :tangle .emacs.d/per-system-settings.el :noweb yes
+
+(require 'map) ;; Needed for map-merge
+
+(setq zmacs/system-settings
+  (map-merge
+    'list
+    '((desktop/dpi . 180)
+      (emacs/default-face-size . 220)
+      (emacs/variable-face-size . 245)
+      (emacs/fixed-face-size . 200)
+      (dunst/font-size . 20)
+      (dunst/max-icon-size . 88))
+    <<system-settings>>))
+
+#+end_src
+
+*** typhon
+
+Home desktop
+
+*.config/guix/systems/typhon.scm:*
+
+#+begin_src scheme :tangle .config/guix/systems/typhon.scm
+
+ (define-module (typhon)
+    #:use-module (base-system)
+    #:use-module (base-system nvidia)
+    #:use-module (gnu)
+    #:use-module (nongnu packages linux))
+
+  (inject-nvidia
+   (operating-system
+    (inherit base-operating-system)
+    (host-name "typhon")
+    (mapped-devices (list (mapped-device
+			   (source (uuid
+				    "37f66e4b-4a82-4340-ae90-76588f3606f5"))
+			   (target "cryptroot")
+			   (type luks-device-mapping))))
+
+    (file-systems (cons* (file-system
+			  (mount-point "/boot/efi")
+			  (device (uuid "450D-4F3B"
+					'fat32))
+			  (type "vfat"))
+			 (file-system
+			  (mount-point "/")
+			  (device "/dev/mapper/cryptroot")
+			  (type "ext4")
+			  (dependencies mapped-devices))
+			 (file-system
+			  (mount-point "/mnt/disk00")
+			  (device
+			   (uuid "9e127c97-98f8-4aab-b086-4672488084e9"))
+			  (type "ext4"))
+			 %base-file-systems))))
+
+#+end_src
+
+*System Settings*
+
+#+begin_src emacs-lisp :noweb-ref system-settings :noweb-sep ""
+
+  (when (equal system-name "typhon")
+    '((desktop/dpi . 180)
+      (emacs/default-face-size . 190)
+      (emacs/variable-face-size . 200)
+      (emacs/fixed-face-size . 190)
+      (dunst/font-size . 20)
+      (dunst/max-icon-size . 88)))
+
+#+end_src
+
+
+** USB Installation Image
+
+*.config/guix/systems/install.scm:*
+
+#+begin_src scheme :tangle .config/guix/systems/install.scm
+
+  ;; Generate a bootable image (e.g. for USB sticks, etc.) with:
+  ;; $ guix system disk-image nongnu/system/install.scm
+
+  (define-module (install)
+    #:use-module (gnu system)
+    #:use-module (gnu system install)
+    #:use-module (gnu packages version-control)
+    #:use-module (gnu packages vim)
+    #:use-module (gnu packages curl)
+    #:use-module (gnu packages emacs)
+    #:use-module (gnu packages linux)
+    #:use-module (gnu packages mtools)
+    #:use-module (gnu packages file-systems)
+    #:use-module (gnu packages package-management)
+    #:use-module (nongnu packages linux)
+    #:export (installation-os-nonfree))
+
+  (define installation-os-nonfree
+    (operating-system
+      (inherit installation-os)
+      (kernel linux)
+      (firmware (list linux-firmware))
+
+      ;; Add the 'net.ifnames' argument to prevent network interfaces
+      ;; from having really long names.  This can cause an issue with
+      ;; wpa_supplicant when you try to connect to a wifi network.
+      (kernel-arguments '("quiet" "modprobe.blacklist=radeon" "net.ifnames=0"))
+
+      ;; Add some extra packages useful for the installation process
+      (packages
+       (append (list exfat-utils fuse-exfat git curl stow vim emacs-no-x-toolkit)
+	       (operating-system-packages installation-os)))))
+
+  installation-os-nonfree
+
+#+end_src
+
+* Profile Management
+
+** Activating Profiles
+
+Example Usage
+
+#+begin_src sh
+
+activate-profiles desktop emacs music
+
+#+end_src
+
+*.local/bin/activate-profiles:*
+
+#+begin_src sh :tangle .local/bin/activate-profiles :shebang #!/bin/sh
+
+GREEN='\033[1;32m'
+RED='\033[1;30m'
+NC='\033[0m'
+GUIX_EXTRA_PROFILES=$HOME/.guix-extra-profiles
+
+profiles=$*
+if [[ $# -eq 0 ]]; then
+    profiles="$HOME/.config/guix/manifests/*.scm";
+fi
+
+for profile in $profiles; do
+  # Remove the path and file extension, if any
+  profileName=$(basename $profile)
+  profileName="${profileName%.*}"
+  profilePath="$GUIX_EXTRA_PROFILES/$profileName"
+  manifestPath=$HOME/.config/guix/manifests/$profileName.scm
+
+  if [ -f $manifestPath ]; then
+    echo
+    echo -e "${GREEN}Activating profile:" $manifestPath "${NC}"
+    echo
+
+    mkdir -p $profilePath
+    guix package --manifest=$manifestPath --profile="$profilePath/$profileName"
+
+    # Source the new profile
+    GUIX_PROFILE="$profilePath/$profileName"
+    if [ -f $GUIX_PROFILE/etc/profile ]; then
+        . "$GUIX_PROFILE"/etc/profile
+    else
+        echo -e "${RED}Couldn't find profile:" $GUIX_PROFILE/etc/profile "${NC}"
+    fi
+  else
+    echo "No profile found at path" $profilePath
+  fi
+done
+
+#+end_src
+
+** Updating Profiles
+
+Example Usage
+
+#+begin_src sh
+
+update-profiles emacs
+
+#+end_src
+
+*.local/bin/update-profiles:*
+
+#+begin_src sh :tangle .local/bin/update-profiles :shebang #!/bin/sh
+
+GREEN='\033[1;32m'
+NC='\033[0m'
+GUIX_EXTRA_PROFILES=$HOME/.guix-extra-profiles
+
+profiles=$*
+if [[ $# -eq 0 ]]; then
+    profiles="$GUIX_EXTRA_PROFILES/*";
+fi
+
+for profile in $profiles; do
+  profileName=$(basename $profile)
+  profilePath=$GUIX_EXTRA_PROFILES/$profileName
+
+  echo
+  echo -e "${GREEN}Updating profile:" $profilePath "${NC}"
+  echo
+
+  guix package --profile="$profilePath/$profileName" --manifest="$HOME/.config/guix/manifests/$profileName.scm"
+done
+
+#+end_src
+
+** Updating Channels
+
+#+begin_src sh :tangle .local/bin/update-channels :shebang #!/bin/sh
+
+  guix pull --channels=$HOME/.config/guix/base-channels.scm
+  guix describe --format=channels > ~/.config/guix/channels.scm
+
+#+end_src
+
+* Dotfiles Management
+
+** Updating
+
+*update-home*
+
+#+begin_src sh :tangle upd :shebang #!/bin/sh
+
+  # Navigate to the directory of this script (generally ~/src/hestia)
+  cd $(dirname $(readlink -f $0))
+
+  # The heavy lifting is done by an Emacs script
+  emacs -Q --script ./.emacs.d/tangle-dotfiles.el
+
+  # Make sure any running Emacs instance gets updated settings
+  emacsclient -e '(load-file ".emacs.d/per-system-settings.el")' -a "echo 'Emacs is not currently running'"
+
+#+end_src
+
+*.emacs.d/tangle-dotfiles.el*
+
+#+begin_src emacs-lisp :tangle .emacs.d/tangle-dotfiles.el
+
+  (require 'org)
+  (load-file "./.emacs.d/lisp/zmacs-settings.el")
+
+  ;; Don't ask when evaluating code blocks
+  (setq org-confirm-babel-evaluate nil)
+
+  (let* ((org-files (directory-files "./" nil "\\.org$")))
+    (defun zmacs/tangle-org-file (org-file)
+      (message "\n\033[1;32mUpdating %s\033[0m\n" org-file)
+      (org-babel-tangle-file (expand-file-name org-file "./")))
+
+    ;; Tangle Systems.org first
+    (zmacs/tangle-org-file "Systems.org")
+
+    (dolist (org-file org-files)
+      (unless (member org-file '("README.org" "Systems.org"))
+      	(zmacs/tangle-org-file org-file))))
+
+#+end_src

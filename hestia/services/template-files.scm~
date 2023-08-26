@@ -1,0 +1,14 @@
+(define-module (hestia services template-files)
+  )
+
+(define (home-template-files-files-service config)
+  )
+
+(define home-template-files-service-type
+  (service-type (name 'home-template-files)
+		(extensions
+		 (list (service-extension
+			home-files-service-type
+			home-raw-files-files-service)))
+		(default-value (#f))
+		(description "Extends home-files service to use a whole directory of template files recursively.")))

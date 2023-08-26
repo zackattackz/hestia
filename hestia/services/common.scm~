@@ -1,0 +1,23 @@
+(define-module (hestia systems common)
+  #:use-module (gnu home)
+  #:use-module (gnu services)
+  #:use-module (gnu home services)
+  #:use-module (gnu home services shells))
+
+(define-public common-home-services
+  '((service home-bash-service-type
+	     (home-bash-configuration
+	      (aliases
+	       '(("gc" . "git commit")))
+	      (bashrc
+	       (list
+		(local-file ".bashrc"
+                            "bashrc")))
+	      (bash-profile
+	       (list
+		(local-file
+                 ".bash_profile"
+                 "bash_profile")))))
+    (simple-service 'emacs-config
+		    home-files-service-type
+		    `((".emacs.d/init.el" ,(local-file "./.emacs.d/init.el"))))))

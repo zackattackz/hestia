@@ -1,0 +1,6 @@
+(define-module (hestia systems typhon home)
+  #:use-module (hestia systems common)
+  #:use-module (gnu home))
+
+(home-environment
+ (services common-home-services))
